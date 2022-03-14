@@ -5,7 +5,6 @@ ignore the hub since it may not be delpoyed on the cluster yet.
 
 check creation date
 check for global hammer
-check for datadog
 """
 
 import sys
@@ -14,10 +13,16 @@ import subprocess
 import argparse
 import re
 import json
+from collections import defaultdict
+import builtins
+import functools
+import traceback
+
 
 import yaml
 
-TEST_SPEC = """
+
+CLUSTER_CHECKS = """
 Globals:
   environment:
     - DEPLOYMENT_NAME
@@ -29,13 +34,17 @@ Globals:
     V_K8S: "1.21"
     MAX_NODE_AGE: 10d
     MAX_EFS_FILE_SYSTEM_SIZE: 50000000000000
+    CORE_NODES: 3
+    NOTEBOOK_EC2_TYPE: r5.xlarge
+    MAX_RESTARTS: 0
+    LOG_REACH: 30m
 Groups:
   - group: Kubernetes Pods
-    command: kubectl get pods -A -o wide
+    command: kubectl get pods -A
     parser: named_columns
     assertions:
     - name: All pods
-      all: READY=='1/1' and STATUS=='Running' and RESTARTS=='0'
+      all: STATUS=='Running' and int(RESTARTS)<=MAX_RESTARTS
     - name: EFS provisioner
       ok_rows==1: NAMESPACE=='support' and 'efs-provisioner' in NAME
     - name: Kube Proxy
@@ -47,21 +56,19 @@ Groups:
     - name: Core DNS
       ok_rows==2: NAMESPACE=='kube-system' and 'coredns' in NAME
   - group: JupyterHub Pods
-    command: kubectl get pods -A -o wide
+    command: kubectl get pods -A
     parser: named_columns
     assertions:
-    - name: All pods
-      all: READY=='1/1' and STATUS=='Running' and RESTARTS=='0'
     - name: Image puller
-      ok_rows==1: NAMESPACE=='default' and 'continuous-image-puller' in NAME
+      ok_rows>=1: NAMESPACE=='default' and 'continuous-image-puller' in NAME
     - name: Hub
       ok_rows==1: NAMESPACE=='default' and 'hub' in NAME
     - name: Proxy
-      ok_rows==1: NAMESPACE=='default' and 'proxy' in NAME
+      ok_rows>=1: NAMESPACE=='default' and 'proxy' in NAME
     - name: User-scheduler
       ok_rows==2: NAMESPACE=='default' and 'user-scheduler' in NAME
-    # - name: User-placeholder
-    #   ok_rows==1: NAMESPACE=='default' and 'user-placeholder' in NAME
+    - name: User-placeholder
+      ok_rows>=1: NAMESPACE=='default' and 'user-placeholder' in NAME
   - group: JupyterHub Nodes
     command: kubectl get nodes -A --show-labels=true
     parser: named_columns
@@ -75,13 +82,13 @@ Groups:
     - name: Node Age
       all: convert_age(AGE) < convert_age(MAX_NODE_AGE)
     - name: Core us-east-1a
-      ok_rows==1:  "'roman-core' in LABELS and 't3.small' in LABELS and 'zone=us-east-1a' in LABELS"
+      ok_rows==1:  "DEPLOYMENT_NAME+'-core' in LABELS and 't3.small' in LABELS and 'zone=us-east-1a' in LABELS"
     - name: Core us-east-1b
-      ok_rows==1:  "'roman-core' in LABELS and 't3.small' in LABELS and 'zone=us-east-1b' in LABELS"
+      ok_rows==1:  "DEPLOYMENT_NAME+'-core' in LABELS and 't3.small' in LABELS and 'zone=us-east-1b' in LABELS"
     - name: Core us-east-1c
-      ok_rows==1:  "'roman-core' in LABELS and 't3.small' in LABELS and 'zone=us-east-1c' in LABELS"
+      ok_rows==1:  "DEPLOYMENT_NAME+'-core' in LABELS and 't3.small' in LABELS and 'zone=us-east-1c' in LABELS"
     - name: Notebook nodes
-      ok_rows>=1:  "'roman-notebook' in LABELS and 'r5.xlarge' in LABELS  and 'region=us-east-1' in LABELS"
+      ok_rows>=1:  "DEPLOYMENT_NAME+'-notebook' in LABELS and NOTEBOOK_EC2_TYPE in LABELS  and 'region=us-east-1' in LABELS"
   - group: EKS Services
     command:  kubectl get services -A
     parser: named_columns
@@ -127,7 +134,7 @@ Groups:
     parser: raw
     assertions:
     - name: DNS Mapping
-      simple: "'{JH_HOSTNAME} is an alias for' in _"
+      simple: "f'{JH_HOSTNAME} is an alias for' in _"
   - group: JupyterHub Index Page
     command: "wget --no-check-certificate -O- {JH_HOSTNAME}"
     parser: raw
@@ -142,12 +149,61 @@ Groups:
       ok_rows==1: Name==DEPLOYMENT_NAME+'-home-dirs' and LifeCycleState=='available' and Encrypted==True and NumberOfMountTargets==3 and OwnerId==ACCOUNT_ID and aws_kv_dict(Tags)['stsci-backup']=='dmd-2w-sat'
     - name: EFS Max Size
       all: int(SizeInBytes['Value']) < MAX_EFS_FILE_SYSTEM_SIZE
+  - group: Daemonsets named rows
+    command: kubectl get daemonsets -A
+    parser: named_rows
+    assertions:
+    - name: datadog - proxy - aws-nodes READY
+      simple: _['datadog']['READY'] == _['kube-proxy']['READY'] == _['aws-node']['READY']
+    - name: datadog - proxy - aws-nodes DESIRED
+      simple: _['datadog']['DESIRED'] == _['kube-proxy']['DESIRED'] == _['aws-node']['DESIRED']
+    - name: datadog - proxy - aws-nodes CURRENT
+      simple: _['datadog']['CURRENT'] == _['kube-proxy']['CURRENT'] == _['aws-node']['CURRENT']
+    - name: datadog - proxy - aws-nodes UP-TO-DATE
+      simple: _['datadog']['UP-TO-DATE'] == _['kube-proxy']['UP-TO-DATE'] == _['aws-node']['UP-TO-DATE']
+    - name: datadog - proxy - aws-nodes AVAILABLE
+      simple: _['datadog']['AVAILABLE'] == _['kube-proxy']['AVAILABLE'] == _['aws-node']['AVAILABLE']
+    - name: continuous image puller notebook nodes only
+      simple: int(_['continuous-image-puller']['READY']) == int(_['aws-node']['READY']) - CORE_NODES
+  - group: Daemonsets named columns
+    command: kubectl get daemonsets -A
+    parser: named_columns
+    assertions:
+    - name: continuous-image-puller
+      ok_rows==1: NAMESPACE=='default' and NAME=='continuous-image-puller'
+    - name: datadog
+      ok_rows==1: NAMESPACE=='datadog' and NAME=='datadog'
+    - name: kube-proxy
+      ok_rows==1: NAMESPACE=='kube-system' and NAME=='kube-proxy'
+    - name:
+      ok_rows==1: NAMESPACE=='kube-system' and NAME=='aws-node'
+    - name: matching daemonset states
+      all: READY==DESIRED==CURRENT==AVAILABLE==_['UP-TO-DATE']
+  - group: EKS AMI Rotation
+    command: awsudo {ADMIN_ARN} aws eks list-nodegroups --cluster-name {DEPLOYMENT_NAME} --query nodegroups --output text
+    parser: raw
+    assertions:
+    - name: Only rotated nodegroup names
+      simple: "functools.reduce(lambda a, b: a and b, [x.count('-')!=1 for x in _.split()])"
+  - group: Log Error Check
+    function: pod_logs(LOG_REACH)
+    parser: yaml
+    assertions:
+    - name: No errors in logs
+      simple: ERRORS==0
+  - group: Pod to Node Map
+    command: kubectl get pods -A -o wide
+    replace_output:
+      input: NOMINATED NODE
+      output: NOMINATED_NODE
+    parser: node_map
+    print_parsing: true
 """  # noqa: E501
 
 
 def convert_age(age_str):
     """Convert k8s abbreviated-style datetime str e.g. 14d2h to an integer."""
-    age_str_org = age_str
+    # age_str_org = age_str
 
     def age_subst(age_str, letter, factor):
         parts = age_str.split(letter)
@@ -160,8 +216,10 @@ def convert_age(age_str):
     age_str = age_subst(age_str, "m", "60")
     age_str = age_subst(age_str, "s", "1")
     age_str = age_str[:-1]
-    print(f"convert_age({repr(age_str_org)}) --> {repr(age_str)} --> {eval(age_str)}")   # nosec
-    return eval(age_str)   # nosec
+    # print(
+    #    f"convert_age({repr(age_str_org)}) --> {repr(age_str)} --> {eval(age_str)}"  # nosec
+    # )  # nosec
+    return eval(age_str)  # nosec
 
 
 def aws_kv_dict(key_value_dict_list):
@@ -175,6 +233,7 @@ def run(cmd, cwd=".", timeout=10):
 
     Returns both stdout+stderr from `cmd`.  (untested, verify manually if in doubt)
     """
+    print(cmd)
     result = subprocess.run(
         cmd.split(),
         stdout=subprocess.PIPE,
@@ -185,6 +244,17 @@ def run(cmd, cwd=".", timeout=10):
         timeout=timeout,
     )  # maybe succeeds
     return result.stdout
+
+
+def parse_node_map(output):
+    namespaces = parse_named_columns(output)
+    node_map = defaultdict(list)
+    for namespace in namespaces:
+        node_map[namespace["NODE"]].append(
+            namespace["NAMESPACE"] + ":" + namespace["NAME"]
+        )
+    output = ["Mapping from Node to Pod", "-" * 80, yaml.dump(dict(node_map))]
+    return "\n".join(output)
 
 
 def parse_named_columns(output):
@@ -215,6 +285,10 @@ def parse_named_columns(output):
     return rows
 
 
+def parse_named_rows(output, key="NAME"):
+    return {"_": {row[key]: row for row in parse_named_columns(output)}}
+
+
 def parse_raw(output):
     """Just return `output` as a single string assigned to dict key '_'
     for reference in assertion expressions.
@@ -238,6 +312,15 @@ def parse_json(output):
     output before JSON parsing.
     """
     return json.loads(output)
+
+
+def parse_none(output):
+    """Return the input as the output,  i.e. no changes."""
+    return output
+
+
+def test_function(parameters):
+    return yaml.dump(parameters)
 
 
 class Checker:
@@ -347,17 +430,19 @@ class Checker:
 
     def __init__(
         self,
-        test_spec,
-        output_file,
-        input_file,
-        verbose,
-        groups_regex,
-        variables,
+        test_spec=CLUSTER_CHECKS,
+        output_file=None,
+        input_file=None,
+        verbose=False,
+        groups_regex=".+",
+        exclude_regex="^$",
+        variables=None,
     ):
         self._output_file = output_file
         self._input_file = input_file
         self._verbose = verbose
         self._groups_regex = groups_regex
+        self._exclude_regex = exclude_regex
         print("===> Loading test spec")
         self.loaded_spec = yaml.safe_load(test_spec)
         self.variables = (
@@ -365,6 +450,7 @@ class Checker:
         )
         self._outputs = {}
         self._errors = 0
+        self._error_msgs = []
 
     @property
     def groups(self):
@@ -382,25 +468,36 @@ class Checker:
         return self.loaded_spec.get("Globals", {}).get("constants", {})
 
     @property
-    def builtin_functions(self):
-        return dict(
-            convert_age=convert_age,
-            aws_kv_dict=aws_kv_dict,
+    def builtins(self):
+        result = {
+            key: getattr(builtins, key) for key in dir(builtins)
+        }  # Python builtins
+        result.update(
+            dict(
+                convert_age=convert_age,
+                aws_kv_dict=aws_kv_dict,
+                test_function=test_function,
+                functools=functools,
+                pod_logs=self.pod_logs,
+            )
         )
+        return result
 
     @property
     def combined_environment(self):
         env = dict()
+        env.update(self.builtins)
         env.update(self.spec_constants)
         env.update(self.spec_environment)
         env.update(self.variables)
-        env.update(self.builtin_functions)
         return env
 
     def main(self):
         self.setup_outputs()
         for check in self.groups:
-            if re.search(self._groups_regex, check["group"], re.IGNORECASE):
+            if re.search(
+                self._groups_regex, check["group"], re.IGNORECASE
+            ) and not re.search(self._exclude_regex, check["group"], re.IGNORECASE):
                 self.run_check(check)
         if self._output_file:
             self.store_outputs()
@@ -421,82 +518,130 @@ class Checker:
         with open(self._output_file, "w+") as file:
             yaml.dump(self._outputs, file)
 
-    def get_command_output(self, check):
-        group = check["group"]
-        if not self._input_file:
-            command = check.get("command").format(**self.combined_environment)
-            print("===> Fetching", repr(group), "with", repr(command))
-            print("=" * 80)
-            try:
-                self._outputs[group] = run(command).strip()
-            except Exception as exc:
-                error = f"Command FAILED for '{group}': '{command}' : '{str(exc)}'"
-                self.error(error)
-                self._outputs[group] = error
-        return self._outputs[group]
+    def replace_output(self, check, output):
+        if check.get("replace_output"):
+            input_patt = check.get("replace_output").get("input")
+            output_patt = check.get("replace_output").get("output")
+            output = re.sub(input_patt, output_patt, output, flags=re.MULTILINE)
+        return output
 
     def run_check(self, check):
         print("=" * 80)
-        output = self.get_command_output(check)
-        print(output)
-        print("=" * 80)
+        try:
+            output = self.get_command_output(check)
+        except Exception as exc:
+            self.error(
+                "Failed obtaining command output for group",
+                repr(check.get("group")),
+                ":",
+                str(exc),
+            )
+            print("=" * 80)
+            return
         if self._output_file:
             return
-        if not output.startswith("Command FAILED"):
+        if not output.startswith("FAILED"):
+            print("-" * 80)
+            print(output)
+            print("=" * 80)
+            self.process_output(check, output)
+
+    def process_output(self, check, output):
+        try:
+            output = self.replace_output(check, output)
             parser = globals()[f"parse_{check['parser']}"]
             namespaces = parser(output)
-            assertions = check.get("assertions", [])
-            self.check_assertions(check["group"], assertions, namespaces)
-            if not assertions:
-                print("======> No assertions defined.")
-
-    def check_assertions(self, group, assertions, namespaces):
-        for assertion in assertions:
-            assertion = dict(assertion)
-            name = assertion.pop("name")
-            print("===> Checking", repr(group), ":", repr(name), ":", assertion)
-            requirement, condition = list(assertion.items())[0]
-            condition = condition.format(**self.combined_environment)
-            if requirement == "simple":
-                self.verify_simple(name, namespaces, condition)
-            elif requirement.startswith(("ok_rows", "all")):
-                self.verify_rows(name, namespaces, requirement, condition)
-            else:
-                raise ValueError(
-                    f"Unhandled requirement: {requirement} for assertion: {assertion}"
+        except Exception as exc:
+            self.error("PARSER failed for", repr(check["group"]), ":", str(exc))
+            return
+        if check.get("print_parsing"):
+            print(namespaces)
+        for assertion in check.get("assertions", []):
+            try:
+                self.check_assertion(check["group"], assertion, namespaces)
+            except Exception as exc:
+                self.error(
+                    "EXECUTION failed for",
+                    repr(check["group"]),
+                    ":",
+                    repr(assertion["name"]),
+                    ":",
+                    str(exc),
                 )
-            print()
 
-    def verify_rows(self, name, namespaces, requirement, condition):
-        self.verbose(f"Checking '{name}': {repr(condition)}")
+    def get_command_output(self, check):
+        group = check["group"]
+        if not self._input_file:
+            self._outputs[group] = self.compute_outputs(group, check)
+        return self._outputs[group]
+
+    def compute_outputs(self, group, check):
+        if check.get("command"):
+            command = check.get("command").format(**self.combined_environment)
+        elif check.get("function"):
+            command = check.get("function").format(**self.combined_environment)
+        else:
+            raise RuntimeError(f"Group {group} doesn't define an input command.")
+        print("===> Fetching", repr(group))
+        print("=" * 80)
+        try:
+            if check.get("command"):
+                outputs = run(command).strip()
+            else:
+                outputs = eval(  # nosec
+                    command, self.combined_environment, self.combined_environment
+                )
+        except Exception as exc:
+            traceback.print_exc()
+            outputs = f"FAILED for '{group}': '{command}' : '{str(exc)}'"
+            self.error(outputs)
+        return outputs
+
+    def check_assertion(self, group_name, assertion, namespaces):
+        assertion = dict(assertion)
+        assertion_name = assertion.pop("name")
+        requirement, condition = list(assertion.items())[0]
+        # condition = condition.format(**self.combined_environment)
+        print(f"Checking assertion '{assertion_name}': {requirement} : {condition}")
+        if requirement == "simple":
+            self.verify_simple(group_name, assertion_name, namespaces, condition)
+        elif requirement.startswith(("ok_rows", "all")):
+            self.verify_rows(
+                group_name, assertion_name, namespaces, requirement, condition
+            )
+        else:
+            raise ValueError(
+                f"Unhandled requirement: {requirement} for assertion: {assertion}"
+            )
+        print()
+
+    def verify_rows(self, group_name, name, namespaces, requirement, condition):
         rows = []
         for i, namespace in enumerate(namespaces):
             self.verbose(f"Checking '{name}' #{i} : {condition} ... ", end="")
-            if self.eval_condition(name, namespace, condition):
+            if self.eval_condition(namespace, condition):
                 rows.append(namespace)
                 self.verbose("OK")
             else:
-                self.verbose("FAILED")
-                self.verbose("Namespace:", namespace)
+                self.verbose("FAILED on row:", namespace)
         if requirement == "all":
             requirement = f"ok_rows=={len(namespaces)}"
-        if eval(requirement, {}, dict(ok_rows=len(rows))):   # nosec
-            print(f"===> OK overall '{name}'")
+        if self.eval_condition(dict(ok_rows=len(rows)), requirement):  # nosec
+            print(f"===> OK '{group_name}' : '{name}'")
         else:
-            self.error(f"overall '{name}'")
+            self.error(f"FAILED '{group_name}' : '{name}' : {condition}")
+
+    def verify_simple(self, group_name, name, namespace, condition):
+        if self.eval_condition(namespace, condition):
+            print(f"===> OK '{group_name}' : '{name}'")
+        else:
+            self.error(f"FAILED '{group_name}' : '{name}' : {condition}")
             self.verbose("Namespace:", namespace)
 
-    def verify_simple(self, name, namespace, condition):
-        if self.eval_condition(name, namespace, condition):
-            print(f"===> OK '{name}'")
-        else:
-            self.error(f"'{name}'")
-            self.verbose("Namespace:", namespace)
-
-    def eval_condition(self, name, namespace, condition):
+    def eval_condition(self, namespace, condition):
         namespace = dict(namespace)  # local no-side-effects copy
         namespace.update(self.combined_environment)
-        return eval(condition, {}, namespace)   # nosec
+        return eval(condition, {}, namespace)  # nosec
 
     def verbose(self, *args, **keys):
         if self._verbose:
@@ -504,7 +649,45 @@ class Checker:
 
     def error(self, *args):
         self._errors += 1
+        self._error_msgs.append(" ".join(str(arg) for arg in args))
         print("===> ERROR: ", *args)
+
+    def show_error_status(self):
+        print("=" * 80)
+        print("Overall", self._errors, "errors occurred:")
+        for msg in self._error_msgs:
+            print(msg)
+
+    def pod_logs(self, log_reach="30m"):
+        loaded = yaml.safe_load(run("kubectl get pods -A --output yaml"))
+        pods = [
+            (pod["metadata"]["namespace"], pod["metadata"]["name"])
+            for pod in loaded["items"]
+        ]
+        print("=" * 80)
+        print("Fetching", len(loaded["items"]), "pod logs")
+        pod_errors = dict()
+        for i, (namespace, name) in enumerate(pods):
+            pod = f"{namespace}:{name}"
+            print()
+            output = run(
+                f"kubectl logs -n {namespace} {name} --since {log_reach} --all-containers --timestamps=True"
+            )
+            for line in output.splitlines():
+                if "error" in line.lower() and "| INFO |" not in line:
+                    self.error(f"FAILED Pod {pod} log:", line)
+                    if pod not in pod_errors:
+                        pod_errors[pod] = []
+                    pod_errors[pod].append(line)
+        print()
+        print("-" * 80)
+        return yaml.dump(
+            {
+                "ERRORS": len(pod_errors),
+                "FAILING_PODS": sorted(list(pod_errors.keys())),
+                "POD_ERRORS": pod_errors,
+            }
+        )
 
 
 def parse_args():
@@ -547,6 +730,14 @@ def parse_args():
         "  Unique group substrings are valid, |-or patterns together. Case is irrelevant.",
     )
     parser.add_argument(
+        "--exclude-regex",
+        dest="exclude_regex",
+        action="store",
+        default="^$",
+        help="Select groups to skip based on the specified regex,  defaulting to no groups."
+        "  Unique group substrings are valid, |-or patterns together. Case is irrelevant.",
+    )
+    parser.add_argument(
         "--variables",
         dest="variables",
         action="store",
@@ -563,20 +754,20 @@ def main():
     Return the number of failing tests or 0 if all tests pass.
     """
     args = parse_args()
-    test_spec = open(args.test_spec).read().strip() if args.test_spec else TEST_SPEC
+    test_spec = (
+        open(args.test_spec).read().strip() if args.test_spec else CLUSTER_CHECKS
+    )
     checker = Checker(
         test_spec=test_spec,
         output_file=args.output_file,
         input_file=args.input_file,
         verbose=args.verbose,
         groups_regex=args.groups_regex,
+        exclude_regex=args.exclude_regex,
         variables=args.variables,
     )
     errors = checker.main()
-    if errors:
-        print("Total Errors:", errors)
-    else:
-        print("No Errors Detected")
+    checker.show_error_status()
     return errors
 
 

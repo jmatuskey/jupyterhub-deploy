@@ -1,0 +1,57 @@
+name: Security Scans
+on:
+   schedule: # weekly
+     - cron: '0 0 * * 0'
+   push:
+   pull_request:
+
+jobs:
+  security-scanning:
+    name: "${{ matrix.DEPLOYMENT_NAME }}  -- Security"
+    runs-on: ubuntu-18.04
+
+    strategy:
+      max-parallel: 5
+      fail-fast: false
+      matrix:
+        DEPLOYMENT_NAME: [ jwebbinar, roman, tike]
+        USE_FROZEN: [ 0 ]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v2
+
+      - name: Set up Python 3.8
+        uses: actions/setup-python@v2
+        with:
+          python-version: 3.8
+
+      - name: Set Up Environment
+        shell: bash
+        run: |
+           tools/image-configure ${{ matrix.DEPLOYMENT_NAME }}  ${{ matrix.USE_FROZEN }}
+           pip install -r requirements.txt
+           df -h
+
+      # - name: Snyk Python-3.8 Security Scan
+      #   continue-on-error: false
+      #   if: ${{ github.event_name == 'push' }}
+      #   uses: snyk/actions/python-3.8@master
+      #   env:
+      #      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      #   with:
+      #      args: --severity-threshold=high
+
+      - name: Bandit Scan
+        shell: bash
+        continue-on-error: false
+        run: |
+           source setup-env
+           tools/sscan-bandit
+
+      - name: Safety Dependencies Scan
+        continue-on-error: false
+        shell: bash
+        run: |
+           source setup-env
+           tools/sscan-safety

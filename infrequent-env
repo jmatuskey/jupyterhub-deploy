@@ -6,9 +6,10 @@ export PATH="`pwd`/tools":${PATH}
 #
 
 export JH_HOSTNAME="${DEPLOYMENT_NAME}.science.stsci.edu"
-if [[ "$ENVIRONMENT" != "prod" ]]; then
+if [[ "$ENVIRONMENT" != "prod" && "$DEPLOYMENT_NAME" != "jwebbinar" ]]; then
     export JH_HOSTNAME="${ENVIRONMENT}.${JH_HOSTNAME}"
 fi
+export JH_HOSTNAME=`echo ${JH_HOSTNAME} | sed -e's/tike/timeseries/g'`
 
 # Select "conda" tool used to install conda package and environments: conda or mamba
 #   mamba is largely a drop-in replacement for mamba with improved dependency resolution,
@@ -19,7 +20,7 @@ export CONDA_VER=conda
 export IMAGE_RUN_PARS="--rm -e JUPYTER_ENABLE_LAB=yes"
 
 # Image scanning,  report Ubuntu status for this version of Ubuntu
-export IMAGE_UBUNTU_NAME="Groovy"
+export IMAGE_UBUNTU_NAME="focal"
 
 # Image scanning,  report CVE's at this severity level and  higher
 export IMAGE_VULNERABILITY_LEVEL="medium"

@@ -46,17 +46,24 @@ COPY --chown=${NB_UID}:${NB_GID} environments/tess/ /opt/environments/tess/
 # Re-building from source ensures compatability with the installed numpy
 # Install these BEFORE the packages which depend on them or you may get incompatible versions from PyPi
 
-# batman-package
-RUN  pip uninstall --yes batman-package && \
-     /opt/common-scripts/env-src-install  tess  https://files.pythonhosted.org/packages/f3/33/3eda063897edb8bd267347da08a9874ddf77eea8244e91daa37411f8bc56/batman-package-2.4.8.tar.gz
+RUN /opt/common-scripts/env-src-install  tess  batman-package
 
-# radvel
-RUN pip uninstall --yes radvel  && \
-    /opt/common-scripts/env-src-install  tess  https://files.pythonhosted.org/packages/d6/0c/7437ea1774f7edb78b291eac38c80361c5e5672ea8e56b28b0df416eee97/radvel-1.4.7.tar.gz
+RUN /opt/common-scripts/env-src-install  tess  radvel
 
-# juliet
-RUN pip uninstall --yes juliet  && \
-    /opt/common-scripts/env-src-install  tess  https://files.pythonhosted.org/packages/95/5c/2a97a352d0c4ba59a0decf06964f5660a13ac57004014a62fe4a9e2a891a/juliet-2.1.2.tar.gz
+RUN /opt/common-scripts/env-src-install  tess  juliet
+
+RUN /opt/common-scripts/env-src-install  tess  tvguide
+
+# ellc is a dependency of allesfitter
+RUN /opt/common-scripts/env-src-install  tess  ellc
+RUN /opt/common-scripts/env-src-install  tess  allesfitter
+
+# ----------------------------------------------------------------------
+# YYYY SEC
+
+USER $NB_USER
+RUN  /opt/common-scripts/npm-audit  /opt/conda/envs/tess/lib/python3.8/site-packages/panel  fix  && \
+     /opt/common-scripts/env-clean
 
 # ========================= ^^^^^ Custom  ^^^^^ =========================
 # ========================= vvvvv Generic vvvvv  =========================
@@ -93,13 +100,21 @@ RUN /opt/common-scripts/fix-certs
 # Copy any remaining environments files not caught by more precise as-needed build copies
 COPY --chown=${NB_UID}:${NB_GID} environments/    /opt/environments/
 
+# ----------------------------------------------------------------------
+# YYYY SEC
+
+USER root
+RUN  /opt/common-scripts/npm-audit  /usr/share/npm/node_modules/socks-proxy-agent  fix  && \
+     /opt/common-scripts/env-clean
+
+RUN  find /opt/conda -name yarn.lock | grep jupyterlab/staging | xargs rm -f || true
+
+# ----------------------------------------------------------------------
 # For standalone operation outside JupyterHub,  note that  /etc also includes
 # common home directory files.   post-start-hook may not include everything required
 # for running on AWS,  just common functions needed for both AWS and standalone/CI.
 
 USER $NB_USER
 WORKDIR /home/$NB_USER
-
 RUN /opt/environments/post-start-hook
-
 CMD [ "start-notebook.sh" ]
