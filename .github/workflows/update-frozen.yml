@@ -48,6 +48,13 @@ jobs:
            tools/image-configure ${{ matrix.DEPLOYMENT_NAME }}  0
            df -h
 
+      - name: Set Chilly Build
+        shell: bash
+        run: |
+          source setup-env
+          ls deployments/roman/image
+          tools/image-chilly-swap "deployments/${{ matrix.DEPLOYMENT_NAME }}/image"
+
       - name: Image Build
         shell: bash
         run: |
@@ -67,12 +74,6 @@ jobs:
            tools/image-test
            df -h
 
-      - name: Create Chilly Build Requirements
-        shell: bash
-        run: |
-          source setup-env
-          tools/image-chilly-freeze
-
       - name: Git Diffs (Frozen Version Specs)
         shell: bash
         run: git diff
@@ -85,6 +86,6 @@ jobs:
           author_name: Mr. Freeze
           message: Automatic requirements update
           branch: update-frozen-${{ matrix.DEPLOYMENT_NAME }}
-          directory: deployments/${{ matrix.DEPLOYMENT_NAME}}/image/env-frozen
+          directory: deployments/${{ matrix.DEPLOYMENT_NAME }}/image/env-frozen
           force: true
           tags: false
